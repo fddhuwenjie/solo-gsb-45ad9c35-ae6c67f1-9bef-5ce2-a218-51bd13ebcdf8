@@ -52,6 +52,72 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def validate_event_content(
+    conn: sqlite3.Connection,
+    *,
+    contract_resolver: ContractResolver,
+    occurred_at: datetime,
+    event_type: str | None = None,
+    schema_version: str | None = None,
+    payload: Any = None,
+    payload_provided: bool = False,
+) -> tuple[datetime, str, str | None, str | None, Any, str | None]:
+    """Validate one event-shaped replacement before any write.
+
+    Shared by first-time ingestion and the immutable amendment chain, so
+    both enforce the exact same rules: the contract triplet
+    (``event_type`` / ``schema_version`` / ``payload``) is all-or-nothing,
+    the registered contract must exist and the payload must satisfy its
+    JSON Schema, and the stored payload form is canonical JSON. Returns
+    ``(occurred, stored_occurred, event_type, schema_version, payload,
+    stored_payload)`` with ``occurred`` normalized to aware UTC.
+
+    Raises :class:`ContractError` (HTTP 422 semantics); performs no
+    writes.
+    """
+    occurred = normalize_ts(occurred_at)
+    stored = to_storage(occurred)
+
+    # The contract triplet is all-or-nothing; point at the missing fields.
+    # Explicit nulls for the scalar fields count as missing; payload null
+    # itself is a legitimate value (a schema may allow {"type": "null"}).
+    provided = {
+        "event_type": event_type is not None,
+        "schema_version": schema_version is not None,
+        "payload": payload_provided,
+    }
+    if any(provided.values()) and not all(provided.values()):
+        missing = [f"/{f}" for f, present in provided.items() if not present]
+        raise ContractError(
+            "event_type, schema_version and payload must be provided together",
+            [
+                {"path": path, "error": "field is required for a payload event"}
+                for path in missing
+            ],
+        )
+
+    stored_payload: str | None = None
+    if event_type is not None:
+        # Validate strictly BEFORE any insert or session computation.
+        document = contract_resolver(conn, event_type, schema_version)
+        if document is None:
+            raise ContractError(
+                "unknown event contract",
+                [
+                    {
+                        "path": "/schema_version",
+                        "error": (
+                            f"schema {event_type!r}/"
+                            f"{schema_version!r} is not registered"
+                        ),
+                    }
+                ],
+            )
+        check_payload(document, payload)
+        stored_payload = canonical_json(payload)
+    return occurred, stored, event_type, schema_version, payload, stored_payload
+
+
 class IngestionConflict(Exception):
     """The event cannot be accepted (HTTP 409 semantics); nothing persists.
 
@@ -163,48 +229,19 @@ class EventIngestionService:
                 device's enabled state machine (mapped to 409); nothing
                 is persisted.
         """
-        occurred = normalize_ts(occurred_at)
-        stored = to_storage(occurred)
+        occurred, stored, event_type, schema_version, payload, stored_payload = (
+            validate_event_content(
+                conn,
+                contract_resolver=self._contract_resolver,
+                occurred_at=occurred_at,
+                event_type=event_type,
+                schema_version=schema_version,
+                payload=payload,
+                payload_provided=payload_provided,
+            )
+        )
         if now is None:
             now = datetime.now(timezone.utc)
-
-        # The contract triplet is all-or-nothing; point at the missing fields.
-        # Explicit nulls for the scalar fields count as missing; payload null
-        # itself is a legitimate value (a schema may allow {"type": "null"}).
-        provided = {
-            "event_type": event_type is not None,
-            "schema_version": schema_version is not None,
-            "payload": payload_provided,
-        }
-        if any(provided.values()) and not all(provided.values()):
-            missing = [f"/{f}" for f, present in provided.items() if not present]
-            raise ContractError(
-                "event_type, schema_version and payload must be provided together",
-                [
-                    {"path": path, "error": "field is required for a payload event"}
-                    for path in missing
-                ],
-            )
-
-        stored_payload: str | None = None
-        if event_type is not None:
-            # Validate strictly BEFORE any insert or session computation.
-            document = self._contract_resolver(conn, event_type, schema_version)
-            if document is None:
-                raise ContractError(
-                    "unknown event contract",
-                    [
-                        {
-                            "path": "/schema_version",
-                            "error": (
-                                f"schema {event_type!r}/"
-                                f"{schema_version!r} is not registered"
-                            ),
-                        }
-                    ],
-                )
-            check_payload(document, payload)
-            stored_payload = canonical_json(payload)
 
         replay = False
         projected_log_row: sqlite3.Row | None = None

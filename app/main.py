@@ -16,6 +16,12 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response, stat
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import db as db_module
+from .amendments import (
+    AmendmentConflict,
+    UnknownEvent,
+    load_chain as load_amendment_chain,
+    submit_amendment,
+)
 from .clockcal import (
     CURSOR_VERSION as TIMELINE_CURSOR_VERSION,
     DEFAULT_DRIFT_PPM,
@@ -214,6 +220,107 @@ class EventAccepted(BaseModel):
             "enabling, or the device/machine projection has no log row"
         ),
     )
+
+
+# ------------------------------------------------------- event amendments
+
+
+class AmendmentIn(BaseModel):
+    amendment_id: str = Field(
+        min_length=1,
+        max_length=256,
+        description="Client-chosen id; (event_id, amendment_id) is idempotent",
+    )
+    base_revision: int = Field(
+        ge=1,
+        description=(
+            "Chain revision the replacement is based on; must equal the "
+            "event's current revision when the request runs"
+        ),
+    )
+    occurred_at: datetime = Field(
+        description="Replacement ISO-8601 timestamp; naive values are treated as UTC"
+    )
+    event_type: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        description="Required together with schema_version and payload.",
+    )
+    schema_version: str | None = Field(
+        default=None, min_length=1, max_length=256
+    )
+    payload: Any = Field(
+        default=None,
+        description="Replacement JSON, validated against the registered contract.",
+    )
+
+
+class EventRevisionOut(BaseModel):
+    revision: int = Field(
+        description=(
+            "1 for the original ingestion record; each accepted amendment "
+            "adds exactly one higher revision"
+        )
+    )
+    amendment_id: str | None = Field(
+        description="Null only for revision 1 (the original ingestion)"
+    )
+    base_revision: int | None = Field(
+        description="Revision this entry was based on; null for revision 1"
+    )
+    device_id: str
+    event_id: str
+    occurred_at: datetime
+    event_type: str | None = None
+    schema_version: str | None = None
+    payload: Any = None
+    created_at: datetime = Field(
+        description=(
+            "Acceptance time of the amendment; for an un-frozen revision 1 "
+            "this is the original occurred_at"
+        )
+    )
+    frozen_at: datetime | None = Field(
+        default=None,
+        description=(
+            "For revision 1, when the original body was first frozen by an "
+            "amendment; null before the first amendment"
+        ),
+    )
+
+
+class EventAmendmentsOut(BaseModel):
+    event_id: str
+    device_id: str
+    current_revision: int = Field(
+        description="Revision of the current effective body"
+    )
+    frozen: bool = Field(
+        description="true once the original body has been frozen into the chain"
+    )
+    frozen_at: datetime | None = None
+    original: EventRevisionOut = Field(description="The immutable revision-1 body")
+    history: list[EventRevisionOut] = Field(
+        description="Every revision in revision order, starting with revision 1"
+    )
+    current: EventRevisionOut = Field(description="The current effective body")
+
+
+class AmendmentAccepted(BaseModel):
+    replay: bool = Field(
+        description="true when the amendment_id was an idempotent replay"
+    )
+    amendment_id: str
+    revision: int = Field(description="Revision created (or replayed) by this request")
+    event_id: str
+    device_id: str
+    current_revision: int
+    frozen: bool
+    frozen_at: datetime | None = None
+    original: EventRevisionOut
+    history: list[EventRevisionOut]
+    current: EventRevisionOut
 
 
 # ------------------------------------------------- session evolution snapshots
@@ -1108,7 +1215,7 @@ def create_app(
         db_module.init_db(db_path)
         yield
 
-    app = FastAPI(title="Device Event Session Merger", version="1.12.0", lifespan=lifespan)
+    app = FastAPI(title="Device Event Session Merger", version="1.13.0", lifespan=lifespan)
     app.state.db_path = db_path
     app.state.gap_seconds = gap
     app.state.drift_ppm = drift_limit
@@ -1478,6 +1585,172 @@ def create_app(
             session=session_out_from_view(outcome.session),
             state_transition=outcome.state_transition,
         )
+
+    # ------------------------------------------------------- event amendments
+
+    def revision_out(
+        device_id: str, event_id: str, revision: Any
+    ) -> EventRevisionOut:
+        return EventRevisionOut(
+            revision=revision.revision,
+            amendment_id=revision.amendment_id,
+            base_revision=revision.base_revision,
+            device_id=device_id,
+            event_id=event_id,
+            occurred_at=revision.occurred_at,
+            event_type=revision.event_type,
+            schema_version=revision.schema_version,
+            payload=revision.payload,
+            created_at=revision.created_at,
+            frozen_at=revision.frozen_at,
+        )
+
+    def amendments_out_from_chain(chain: Any) -> EventAmendmentsOut:
+        return EventAmendmentsOut(
+            event_id=chain.event_id,
+            device_id=chain.device_id,
+            current_revision=chain.current_revision,
+            frozen=chain.frozen,
+            frozen_at=chain.frozen_at,
+            original=revision_out(chain.device_id, chain.event_id, chain.original),
+            history=[
+                revision_out(chain.device_id, chain.event_id, revision)
+                for revision in chain.revisions
+            ],
+            current=revision_out(chain.device_id, chain.event_id, chain.current),
+        )
+
+    @app.post(
+        "/events/{event_id}/amendments",
+        response_model=AmendmentAccepted,
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            200: {"description": "idempotent replay of an existing amendment_id"},
+            404: {"description": "the event has never been ingested"},
+            409: {
+                "description": (
+                    "stale base_revision (another branch advanced the chain), "
+                    "or amendment_id already exists with different content"
+                )
+            },
+            422: {"description": "unknown contract or payload validation failure"},
+        },
+    )
+    def create_event_amendment(
+        event_id: str,
+        body: AmendmentIn,
+        response: Response,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> AmendmentAccepted:
+        """Append one immutable full-replacement amendment to an event.
+
+        The replacement covers ``occurred_at`` and the contract triplet
+        (``event_type`` / ``schema_version`` / ``payload``), validated
+        exactly like ``POST /events`` -- including payload-less events and
+        switching between the two forms. ``device_id`` and ``event_id`` are
+        identity and cannot change: the amendment stays bound to the
+        original ingestion record and every derived result (sessions,
+        state-machine projections, alarms, stream ledgers) and the Merkle
+        receipt keeps using the original body.
+
+        The whole decision runs in one ``BEGIN IMMEDIATE`` transaction and
+        the ``base_revision`` must equal the chain's current revision, so
+        concurrent branches serialize on the single writer lock and only
+        one of them succeeds; a stale branch sees the advanced revision and
+        receives ``409`` with nothing stored. The first accepted amendment
+        freezes the original body as revision 1 into the amendment table
+        (surviving later retention cleanup). Re-POSTing the same
+        ``amendment_id`` with the same base and full content replays ``200``
+        idempotently; the same id with changed content or base returns
+        ``409``.
+        """
+        # Cheap pre-lock lookup for the 404 case; the authoritative source
+        # check happens inside the write transaction.
+        if load_amendment_chain(conn, event_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"event {event_id!r} has never been ingested",
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            outcome = submit_amendment(
+                conn,
+                contract_resolver=get_contract,
+                event_id=event_id,
+                amendment_id=body.amendment_id,
+                base_revision=body.base_revision,
+                occurred_at=body.occurred_at,
+                event_type=body.event_type,
+                schema_version=body.schema_version,
+                payload=body.payload,
+                payload_provided="payload" in body.model_fields_set,
+            )
+            conn.commit()
+        except UnknownEvent as exc:
+            conn.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"event {str(exc)!r} has never been ingested",
+            ) from exc
+        except ContractError as exc:
+            conn.rollback()
+            raise unprocessable(exc) from exc
+        except AmendmentConflict as exc:
+            conn.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=exc.detail
+            ) from exc
+        except Exception:
+            conn.rollback()
+            raise
+
+        chain = outcome.chain
+        if outcome.replay:
+            response.status_code = status.HTTP_200_OK
+        return AmendmentAccepted(
+            replay=outcome.replay,
+            amendment_id=body.amendment_id,
+            revision=outcome.revision,
+            event_id=chain.event_id,
+            device_id=chain.device_id,
+            current_revision=chain.current_revision,
+            frozen=chain.frozen,
+            frozen_at=chain.frozen_at,
+            original=revision_out(chain.device_id, chain.event_id, chain.original),
+            history=[
+                revision_out(chain.device_id, chain.event_id, revision)
+                for revision in chain.revisions
+            ],
+            current=revision_out(chain.device_id, chain.event_id, chain.current),
+        )
+
+    @app.get(
+        "/events/{event_id}/amendments",
+        response_model=EventAmendmentsOut,
+        responses={
+            404: {"description": "the event has never been ingested (and is not frozen)"},
+        },
+    )
+    def get_event_amendments(
+        event_id: str,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> EventAmendmentsOut:
+        """Read the immutable amendment chain of one event.
+
+        Returns the frozen ``original`` revision-1 body, ``history`` (every
+        revision ordered by ``revision``) and the ``current`` effective
+        body. Before the first amendment the chain holds exactly one
+        revision built from the live ingestion row; afterwards the chain is
+        read from the frozen amendment table, so the full history stays
+        available after retention cleanup has deleted the event body.
+        """
+        chain = load_amendment_chain(conn, event_id)
+        if chain is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"event {event_id!r} has never been ingested",
+            )
+        return amendments_out_from_chain(chain)
 
     @app.get("/devices/{device_id}/sessions", response_model=list[SessionOut])
     def list_sessions(

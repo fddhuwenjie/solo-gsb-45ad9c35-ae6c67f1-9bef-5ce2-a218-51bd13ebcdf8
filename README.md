@@ -16,6 +16,8 @@
 
 服务还提供**会话演变快照**：`POST /devices/{device_id}/session-snapshots` 在同一写事务内冻结设备当前的事件单调序列高水位（`events.seq`）并按现有 gap 配置把当时的会话与**有序成员完整复制**入库；`snapshot_id` 全局唯一，同设备重复提交幂等返回原快照，跨设备复用返回 `409`。两快照差异接口以共享 `event_id` 构建旧/新会话二部图，按连通分量判定 `unchanged`、`changed`、`merged`、`split`、`created`、`removed`，多对多分量标为 `reorganized`，输出双方会话 ID、增删成员并稳定排序；gap 配置不同的快照拒绝比较。迟到事件与保留清理都不会改写旧快照（见[会话演变快照](#会话演变快照)）。
 
+事件还支持**不可变的更正链**：`POST /events/{event_id}/amendments` 以客户端选择的 `amendment_id` 与乐观并发的 `base_revision` 提交**完整替代正文**——`device_id` / `event_id` 永不可改，`occurred_at` 与契约三元组（`event_type` / `schema_version` / `payload`）整体替换且载荷仍按 JSON Schema 校验。原始摄取记录固定为 **revision 1**，首次更正时把原始正文冻结到独立的 `event_amendments` 表；并发分支在 `BEGIN IMMEDIATE` 内以 `base_revision == 当前版本` 判定，**只有一个分支成功**，过期分支返回 `409` 且不落库，同 ID 同内容幂等回放、同 ID 改写返回 `409`。更正**不重放**任何派生：会话、状态机投影、告警、采集流绑定与 Merkle 回执始终以原始摄取记录为准（见[事件更正链](#事件更正链)）。
+
 ## 启动
 
 ```bash
@@ -162,6 +164,101 @@ curl -s -X POST http://localhost:8000/events \
   -H 'Content-Type: application/json' \
   -d '{"device_id":"dev-1","event_id":"e1","occurred_at":"2026-09-20T10:00:00Z"}'
 ```
+
+### 事件更正链 `POST /events/{event_id}/amendments`
+
+已接受的事件可以发布**不可变更正**：更正不是原地改写，而是在一条仅追加的链上追加一个完整替代版本。版本自 **revision 1** 起编号——**revision 1 永远是原始摄取记录**；首次接受更正时，服务在同一写事务内把原始正文（`occurred_at`、`event_type`、`schema_version`、`payload` 的完整副本）冻结到独立的 `event_amendments` 表，之后每个更正依次成为 revision 2、3、……。
+
+**身份不可改、正文整体替换**：`device_id` 与 `event_id` 是身份，永远绑定原始摄取记录；请求体只包含：
+
+| 字段 | 说明 |
+|---|---|
+| `amendment_id` | 客户端选择的 id（1..256 字符）；`(event_id, amendment_id)` 幂等 |
+| `base_revision` | 本次更正所基于的版本，必须 ≥ 1，且执行时**等于当前版本** |
+| `occurred_at` | 替代时间（ISO-8601，朴素时间按 UTC；等价时区写法归一化） |
+| `event_type` / `schema_version` / `payload` | 替代契约三元组；规则与 `POST /events` 完全一致（三者要么全给、要么全不给，载荷按已注册 JSON Schema 校验）；允许在载荷事件与无载荷事件之间切换 |
+
+- `201 Created`：更正已接受，`revision` 为新版本号；响应同时返回冻结的 `original`（revision 1）、按 `revision` 排序的 `history` 与 `current` 当前有效正文，以及 `frozen` / `frozen_at`。
+- `200 OK`：同一 `event_id` 下相同 `amendment_id` 且**基础版本与完整替代内容完全一致**的重复提交——幂等回放（`replay: true`），返回该更正对应的已存版本，不新增链上版本；即使链头已继续前进，旧更正的同内容重放仍是 `200`。
+- `409 Conflict`：
+  - `reason: "stale_base_revision"`：`base_revision` 不等于当前版本（另一个分支已经推进了链）。响应给出 `base_revision` 与 `current_revision`；请重新 GET 当前正文、解决差异后以新版本为基重试。**本次不写入任何内容**。
+  - `reason: "amendment_id_conflict"`：同一 `(event_id, amendment_id)` 已存在但基础版本或替代内容不同。amendment_id 一经使用即不可改写。
+- `422 Unprocessable Entity`：契约不存在、载荷不满足 JSON Schema、三元组不全，或 `base_revision < 1`；同样**不冻结、不写入**。
+- `404 Not Found`：该 `event_id` 从未被摄取（无原始记录也无冻结链）。
+
+**乐观并发（仅一个分支成功）**：判定与写入都在路由开启的单个 `BEGIN IMMEDIATE` 事务内完成。两个从同一 `base_revision` 出发的并发更正先在 SQLite 单写者锁上排队，先到者把版本从 N 推进到 N+1；后到者在锁内重新读到当前版本 N+1，其基准仍是 N，于是得到 `409 stale_base_revision` 并整体回滚——**同一基准下有且仅有一个分支落库**。
+
+```bash
+BASE=http://localhost:8000
+
+# 原始事件（revision 1）
+curl -s -X POST $BASE/events -H 'Content-Type: application/json' -d '{
+  "device_id":"dev-1","event_id":"e1","occurred_at":"2026-09-20T10:00:00Z",
+  "event_type":"telemetry","schema_version":"1.0","payload":{"reading":{"value":21.5,"unit":"c"},"tags":["warm"]}
+}'
+
+# 首次更正：冻结原始正文并追加 revision 2
+curl -s -X POST $BASE/events/e1/amendments -H 'Content-Type: application/json' -d '{
+  "amendment_id":"fix-reading","base_revision":1,
+  "occurred_at":"2026-09-20T10:00:00Z",
+  "event_type":"telemetry","schema_version":"1.0",
+  "payload":{"reading":{"value":22.5,"unit":"c"},"tags":["warm"]}
+}'
+# 201 {"replay":false,"amendment_id":"fix-reading","revision":2,
+#      "current_revision":2,"frozen":true,"frozen_at":"…",
+#      "original":{"revision":1,"amendment_id":null,"base_revision":null,
+#                  "payload":{"reading":{"value":21.5,…}}, …},
+#      "history":[{"revision":1,…},{"revision":2,"amendment_id":"fix-reading",
+#                              "base_revision":1,"payload":{"reading":{"value":22.5,…}}}],
+#      "current":{…revision 2…}}
+
+# 同 id 同内容重放 -> 200 replay=true
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/events/e1/amendments \
+  -H 'Content-Type: application/json' -d '{"amendment_id":"fix-reading","base_revision":1,
+       "occurred_at":"2026-09-20T10:00:00Z","event_type":"telemetry",
+       "schema_version":"1.0",
+       "payload":{"reading":{"value":22.5,"unit":"c"},"tags":["warm"]}}'   # => 200
+
+# 同 id 不同内容 -> 409 amendment_id_conflict（链不变）
+# 基于过期 revision 1 再开分支 -> 409 stale_base_revision（不落库）
+curl -s -X POST $BASE/events/e1/amendments -H 'Content-Type: application/json' -d '{
+  "amendment_id":"another-fix","base_revision":1,
+  "occurred_at":"2026-09-20T10:00:01Z"
+}'
+# 409 {"detail":{"reason":"stale_base_revision","base_revision":1,"current_revision":2,…}}
+
+# 以当前版本为基继续更正 -> 201 revision 3
+curl -s -X POST $BASE/events/e1/amendments -H 'Content-Type: application/json' -d '{
+  "amendment_id":"drop-payload","base_revision":2,
+  "occurred_at":"2026-09-20T10:00:00Z"
+}'
+```
+
+**派生结果与回执始终以原始摄取为准**：更正**不重放**任何摄取期派生——`events` 行保持原始正文不变，因此实时会话归并（含 `session_id`）、状态机当前状态与转移日志、告警触发/失效、采集流序号绑定都不会因更正而改变；`POST /events/search`、`GET /devices/.../sessions` 等读取的仍是原始正文。透明回执的 Merkle 叶绑定的是首次摄取字段（`receipt_leaves` 不随更正变化），旧成员证明、检查点与一致性证明继续验证原始记录。若需要让消费者看到修正，可凭 `GET` 链自行以 `current` 叠加。对同一 `event_id` 重新 `POST /events` 的语义也不变：与原始正文一致是幂等重放（`200`），与（已更正的）新正文不同仍是 `409`。
+
+### 查询更正链 `GET /events/{event_id}/amendments`
+
+返回 `event_id` / `device_id`、`current_revision`、`frozen`（是否已冻结原始正文）、`frozen_at`，以及：
+
+- `original`：不可变的 revision 1 正文（首次更正后 `frozen_at` 给出冻结时刻；此前为 `null`）；
+- `history`：按 `revision` 升序的全部版本（revision 1 起）；
+- `current`：当前有效正文（未更正时即原始记录）。
+
+首次更正之前链只有一个由实时 `events` 行构造的 revision；首次更正之后整条链都从冻结副本读取，因此**经[可确认的保留清理](#可确认的保留清理)删除事件正文后，原始版本、完整历史与当前正文仍可正常读取**，并且清理之后还可以继续基于当前版本追加更正（冻结表对 `events` 不建外键）。从未摄取的 `event_id` 返回 `404`。
+
+```bash
+curl -s $BASE/events/e1/amendments
+# {"event_id":"e1","device_id":"dev-1","current_revision":3,"frozen":true,
+#  "frozen_at":"…",
+#  "original":{"revision":1,"amendment_id":null,"base_revision":null,"payload":{…原始…},…},
+#  "history":[{"revision":1,…},{"revision":2,"amendment_id":"fix-reading",…},
+#             {"revision":3,"amendment_id":"drop-payload","event_type":null,…}],
+#  "current":{…revision 3…}}
+```
+
+### 存储、迁移与并发
+
+更正链持久化在 SQLite 的 `event_amendments` 表：`revision` 从 1 起，revision 1 为原始正文的冻结副本（`amendment_id` / `base_revision` 为 NULL），其后每行是一次完整替代（非空 `amendment_id`、`base_revision >= 1`）。`UNIQUE (event_id, amendment_id)` 支撑同 id 幂等与改写 `409` 判定，部分唯一索引 `(event_id, revision)` 保证每个事件每版本只有一行，`CHECK` 约束区分冻结行与更正行；表对 `events` **不建外键**，清理只删实时事件正文、冻结链原样保留。升级到本版本时服务启动以 `CREATE TABLE IF NOT EXISTS` **自动、幂等**建表（旧库无需手工脚本，已存在的事件即隐式 revision 1；Docker Compose 启动方式、端口与既有接口完全不变）。并发模型沿用 WAL + `BEGIN IMMEDIATE` + `busy_timeout`：基准校验、原始冻结与替代插入在同一把单写者锁下提交，同一基准的并发更正恰好一个成功、其余 `409` 且不留痕。
 
 ### 查询设备的全部会话 `GET /devices/{device_id}/sessions`
 
@@ -1274,7 +1371,7 @@ curl -s localhost:8000/devices/d/sessions        # => 1 个会话，成员 [a, c
 
 ## 持久化与并发模型
 
-契约（文档、`supersedes`、注册时间）与事件的 `event_type` / `schema_version` / `payload` 均保存在 SQLite（`schemas` 表与扩展后的 `events` 表）。保留清理计划保存在 `cleanup_plans` 表（条件、候选快照、摘要、状态、确认时间）。下行命令队列保存在 `device_commands` 表（`seq`、命令标识与规范化 payload、租约/退避时间戳、`attempts` 与终态）。版本化告警规则、告警实例、命中进度与规则版本的事件时间时代边界保存在 `alarm_rules` / `alarms` / `alarm_rule_progress` 表。设备状态机的不可变版本定义、启用状态/当前状态/到达高水位与追加式转移日志保存在 `state_machine_versions` / `device_state_machines` / `state_transitions_log` 表。设备时钟校准锚点保存在 `clock_anchors` 表（观测序号、设备/参考时间、epoch、实测漂移与持久 `seq`）。采集流、序号账本与检查点保存在 `collection_streams` / `collection_stream_events` / `collection_stream_checkpoints` 表。会话演变快照保存在 `session_snapshots` / `session_snapshot_sessions` 表（冻结的高水位、gap 配置与会话成员的完整 JSON 副本，不引用 `events` 行）。事件透明回执的 Merkle 叶与不可变检查点保存在 `receipt_leaves` / `receipt_checkpoints` 表（叶的完整规范化字段与 RFC 6962 叶哈希，不引用 `events` 行，清理后仍可验证）。服务启动时自动幂等建表、为旧版数据库补齐新列、按需建出队列表，历史数据无需迁移脚本。`events` 上维护 `(device_id, occurred_at, event_id)` 与 `(occurred_at, event_id)` 两个索引，后者供 `POST /events/search` 的跨设备键集扫描使用；`device_commands` 上维护 `(device_id, seq)` 索引以支持严格 FIFO 取队首；`alarms` 上维护 `(device_id, fired_at)` 索引以支持告警列表；`state_transitions_log` 上维护 `(device_id, id)` 索引以支持按到达序的游标分页；`clock_anchors` 上维护 `(device_id, observed_seq)` 与 `(device_id, seq)` 两个索引，分别支撑锚点链校验与时间线首屏的逐设备锚点高水位冻结。
+契约（文档、`supersedes`、注册时间）与事件的 `event_type` / `schema_version` / `payload` 均保存在 SQLite（`schemas` 表与扩展后的 `events` 表）。保留清理计划保存在 `cleanup_plans` 表（条件、候选快照、摘要、状态、确认时间）。下行命令队列保存在 `device_commands` 表（`seq`、命令标识与规范化 payload、租约/退避时间戳、`attempts` 与终态）。版本化告警规则、告警实例、命中进度与规则版本的事件时间时代边界保存在 `alarm_rules` / `alarms` / `alarm_rule_progress` 表。设备状态机的不可变版本定义、启用状态/当前状态/到达高水位与追加式转移日志保存在 `state_machine_versions` / `device_state_machines` / `state_transitions_log` 表。设备时钟校准锚点保存在 `clock_anchors` 表（观测序号、设备/参考时间、epoch、实测漂移与持久 `seq`）。采集流、序号账本与检查点保存在 `collection_streams` / `collection_stream_events` / `collection_stream_checkpoints` 表。会话演变快照保存在 `session_snapshots` / `session_snapshot_sessions` 表（冻结的高水位、gap 配置与会话成员的完整 JSON 副本，不引用 `events` 行）。事件透明回执的 Merkle 叶与不可变检查点保存在 `receipt_leaves` / `receipt_checkpoints` 表（叶的完整规范化字段与 RFC 6962 叶哈希，不引用 `events` 行，清理后仍可验证）。事件更正链保存在 `event_amendments` 表（revision 1 的冻结原始正文与之后每个完整替代版本，`amendment_id` 幂等/冲突判定与 `base_revision` 链接；不引用 `events` 行，清理后历史仍可读取且可继续更正；实时 `events` 行保持原始正文不变，所有派生结果与回执始终以原始摄取为准）。服务启动时自动幂等建表、为旧版数据库补齐新列、按需建出队列表，历史数据无需迁移脚本。`events` 上维护 `(device_id, occurred_at, event_id)` 与 `(occurred_at, event_id)` 两个索引，后者供 `POST /events/search` 的跨设备键集扫描使用；`device_commands` 上维护 `(device_id, seq)` 索引以支持严格 FIFO 取队首；`alarms` 上维护 `(device_id, fired_at)` 索引以支持告警列表；`state_transitions_log` 上维护 `(device_id, id)` 索引以支持按到达序的游标分页；`clock_anchors` 上维护 `(device_id, observed_seq)` 与 `(device_id, seq)` 两个索引，分别支撑锚点链校验与时间线首屏的逐设备锚点高水位冻结。
 
 ### 自动迁移与单调序列 `seq`
 
@@ -1297,6 +1394,8 @@ cursor 前缀随游标格式升级：事件检索当前为 `evc2:`（seq 高水�
 清理确认的并发安全要点：确认端点开写锁**之后**才重新读取计划行，因此并发确认在锁上排队——先到者负责删除并置 `confirmed`（或在漂移时置 `invalidated`），后到者只回放终态结果，不会因“候选刚被前一个请求删掉”而把幂等重放误报为 `409`。
 
 租约结算（ack/nack）的并发安全要点与 claim 一致：请求先以 `BEGIN IMMEDIATE` 取得写锁，再做命令查找、token 与到期校验和状态更新；UPDATE 的 WHERE 同时要求 `state='pending'`、存储的 `lease_token` 等于请求 token、`expires_at` 晚于当前时刻，并以命中行数（必须为 1）判定胜负。于是同一 token 的并发结算（ack/ack、nack/nack、ack/nack）在锁上串行化后只有先到者成功；nack 作废、租约到期重领导致 token 轮换之后，持旧 token 到达的结算请求匹配 0 行，返回 `409` 且绝不改状态。
+
+事件更正链的并发安全要点：`POST /events/{event_id}/amendments` 在开启 `BEGIN IMMEDIATE` 之后才读取当前链版本并比对 `base_revision`，同一基准出发的并发更正因此在单写者锁上严格串行——先到者冻结原始正文（首次）并追加新版本，后到者在锁内看到已推进的 `current_revision`，基准不再相等，得到 `409 stale_base_revision` 并整体回滚，链上不会出现分叉或空洞；同 `amendment_id` 的并发重放以 `UNIQUE (event_id, amendment_id)` 与逐字段内容比较兜底，内容一致回放 `200`，任何差异一律 `409`。
 
 ## 摄取链路架构（POST /events）
 

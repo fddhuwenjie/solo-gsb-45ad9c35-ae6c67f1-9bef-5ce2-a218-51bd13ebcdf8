@@ -34,6 +34,42 @@ CREATE INDEX IF NOT EXISTS idx_events_device_time
 -- Keyset order used by POST /events/search, including cross-device scans.
 CREATE INDEX IF NOT EXISTS idx_events_time_id
     ON events (occurred_at, event_id);
+-- Immutable amendment chain for accepted events. ``device_id`` and
+-- ``event_id`` are identity and never change; every other body field
+-- (occurred_at, event_type, schema_version, payload) is replaced whole by
+-- an amendment. Revision 1 is the *frozen copy* of the original ingestion
+-- body (amendment_id/base_revision NULL), written by the first amendment;
+-- revisions >= 2 are full replacements addressed by a client-chosen,
+-- globally unique amendment_id and chained to an explicit base_revision.
+-- The original event stays in ``events`` untouched: sessions, state
+-- machines, alerts, stream ledgers and Merkle receipts keep referring to
+-- the original ingestion record. Like the receipt and snapshot tables
+-- this table deliberately has no REFERENCES events(event_id): retention
+-- cleanup may delete the live event body while the frozen chain must stay
+-- readable. UNIQUE(event_id, amendment_id) supports idempotent replays
+-- (same id, same content) and 409 rewrites (same id, other content); the
+-- unique (event_id, revision) index pins one row per revision and event,
+-- and the CHECK constraint keeps revision 1 the single frozen original.
+CREATE TABLE IF NOT EXISTS event_amendments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,  -- durable chain order
+    revision      INTEGER NOT NULL CHECK (revision >= 1),
+    amendment_id  TEXT,  -- NULL only for the frozen original (revision 1)
+    base_revision INTEGER,  -- NULL only for the frozen original (revision 1)
+    device_id     TEXT NOT NULL,
+    event_id      TEXT NOT NULL,
+    occurred_at   TEXT NOT NULL,  -- UTC ISO-8601, lexicographically sortable
+    event_type    TEXT,
+    schema_version TEXT,
+    payload       TEXT,  -- canonicalized JSON, NULL for payload-less revisions
+    created_at    TEXT NOT NULL,  -- acceptance (revision 1: freeze) time
+    UNIQUE (event_id, amendment_id),
+    CHECK (
+        (revision = 1 AND amendment_id IS NULL AND base_revision IS NULL)
+        OR (revision >= 2 AND amendment_id IS NOT NULL AND base_revision >= 1)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_amendments_event_revision
+    ON event_amendments (event_id, revision);
 CREATE TABLE IF NOT EXISTS cleanup_plans (
     plan_id     TEXT PRIMARY KEY,
     device_id   TEXT NOT NULL,
