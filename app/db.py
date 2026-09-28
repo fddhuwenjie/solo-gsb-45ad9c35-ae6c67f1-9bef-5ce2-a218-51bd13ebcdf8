@@ -356,6 +356,40 @@ CREATE TABLE IF NOT EXISTS receipt_checkpoints (
     root_hash  TEXT NOT NULL,  -- Merkle root over leaves 0..tree_size-1, hex
     created_at TEXT NOT NULL
 );
+-- Immutable event amendment chain. revision 1 is the original ingestion
+-- record, frozen verbatim from ``events`` inside the FIRST amendment's
+-- write transaction (``amendment_id``/``base_revision`` are NULL for it);
+-- every later row is one amendment carrying its client-chosen
+-- ``amendment_id`` and the ``base_revision`` it was built on. Rows are
+-- append-only: corrections also UPDATE the live ``events`` body columns
+-- in place, but the persistent ``events.seq`` (arrival order), the
+-- transparency receipt leaf and every already-computed derived result keep
+-- referencing the original ingestion. ``UNIQUE (event_id, amendment_id)``
+-- backs both the idempotent replay (identical content -> 200) and the 409
+-- (same id, different content); SQLite permits multiple NULLs, so the
+-- revision-1 row does not occupy an amendment_id. The table deliberately
+-- has no REFERENCES events(event_id): retention cleanup deletes only event
+-- bodies, while the frozen revisions -- including the original -- stay
+-- readable afterwards. Created idempotently at startup, so pre-existing
+-- databases need no migration.
+CREATE TABLE IF NOT EXISTS event_amendments (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id       TEXT NOT NULL,
+    revision       INTEGER NOT NULL CHECK (revision >= 1),
+    amendment_id   TEXT,  -- client-chosen id; NULL only for frozen revision 1
+    base_revision  INTEGER CHECK (base_revision IS NULL OR base_revision >= 1),
+    device_id      TEXT NOT NULL,  -- immutable, copied from the ingested event
+    occurred_at    TEXT NOT NULL,  -- UTC ISO-8601 (amendable body column)
+    event_type     TEXT,
+    schema_version TEXT,
+    payload        TEXT,           -- canonicalized JSON, NULL when payload-less
+    created_at     TEXT NOT NULL,  -- freeze time for rev 1, acceptance time otherwise
+    UNIQUE (event_id, revision),
+    UNIQUE (event_id, amendment_id)
+);
+-- Chronological listing of one event's chain.
+CREATE INDEX IF NOT EXISTS idx_event_amendments_event_rev
+    ON event_amendments (event_id, revision);
 """
 
 # Columns added after the initial release; applied idempotently to existing DBs.

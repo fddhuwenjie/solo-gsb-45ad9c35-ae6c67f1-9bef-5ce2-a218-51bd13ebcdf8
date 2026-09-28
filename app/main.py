@@ -16,6 +16,12 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response, stat
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import db as db_module
+from .amendments import (
+    AmendmentConflict,
+    EventNotFound,
+    apply_amendment,
+    get_history as get_amendment_history,
+)
 from .clockcal import (
     CURSOR_VERSION as TIMELINE_CURSOR_VERSION,
     DEFAULT_DRIFT_PPM,
@@ -214,6 +220,86 @@ class EventAccepted(BaseModel):
             "enabling, or the device/machine projection has no log row"
         ),
     )
+
+
+# ----------------------------------------------------- immutable amendments
+
+
+class EventAmendmentIn(EventIn):
+    amendment_id: str = Field(
+        min_length=1,
+        max_length=256,
+        description=(
+            "Client-chosen id of this correction, unique within the event; "
+            "re-POSTing the same id with identical content replays the "
+            "stored amendment, different content returns 409"
+        ),
+    )
+    base_revision: int = Field(
+        ge=1,
+        description=(
+            "Revision the client started from. The first amendment bases on "
+            "revision 1 (the original ingestion); it must equal the current "
+            "revision inside the write transaction or the request is a "
+            "stale branch (409) and stores nothing"
+        ),
+    )
+
+
+class EventRevisionOut(BaseModel):
+    revision: int = Field(description="1 is the original ingestion; each amendment adds one")
+    amendment_id: str | None = Field(
+        default=None,
+        description="Null for revision 1 (the original ingestion record)",
+    )
+    base_revision: int | None = Field(
+        default=None,
+        description="Revision this correction was based on; null for revision 1",
+    )
+    device_id: str
+    event_id: str
+    occurred_at: datetime
+    event_type: str | None = None
+    schema_version: str | None = None
+    payload: Any = None
+    created_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Acceptance time of the amendment, or the freeze time of the "
+            "original revision when the first amendment froze it; null for "
+            "an event that has never been amended"
+        ),
+    )
+
+
+class EventAmendmentsOut(BaseModel):
+    event_id: str
+    current_revision: int = Field(
+        description="Revision of the current effective body (1 before any amendment)"
+    )
+    original: EventRevisionOut = Field(
+        description="The immutable original ingestion record"
+    )
+    history: list[EventRevisionOut] = Field(
+        description=(
+            "Accepted amendments in revision order (revisions 2..current); "
+            "empty before the first amendment"
+        )
+    )
+    current: EventRevisionOut = Field(
+        description="The current effective body; equals original before any amendment"
+    )
+
+
+class EventAmendmentAcceptedOut(BaseModel):
+    replay: bool = Field(
+        description="true when the same amendment_id with identical content was replayed"
+    )
+    amendment_id: str
+    revision: int = Field(description="Revision created by this amendment")
+    base_revision: int
+    event: EventOut = Field(description="The event's body after applying the amendment")
+    amendments: EventAmendmentsOut
 
 
 # ------------------------------------------------- session evolution snapshots
@@ -1108,7 +1194,7 @@ def create_app(
         db_module.init_db(db_path)
         yield
 
-    app = FastAPI(title="Device Event Session Merger", version="1.12.0", lifespan=lifespan)
+    app = FastAPI(title="Device Event Session Merger", version="1.13.0", lifespan=lifespan)
     app.state.db_path = db_path
     app.state.gap_seconds = gap
     app.state.drift_ppm = drift_limit
@@ -1478,6 +1564,202 @@ def create_app(
             session=session_out_from_view(outcome.session),
             state_transition=outcome.state_transition,
         )
+
+    # ---------------------------------------------------- immutable amendments
+
+    def revision_out_from_stored(revision) -> EventRevisionOut:
+        return EventRevisionOut(
+            revision=revision.revision,
+            amendment_id=revision.amendment_id,
+            base_revision=revision.base_revision,
+            device_id=revision.device_id,
+            event_id=revision.event_id,
+            occurred_at=from_storage(revision.occurred_at),
+            event_type=revision.event_type,
+            schema_version=revision.schema_version,
+            payload=(
+                json.loads(revision.payload)
+                if revision.payload is not None
+                else None
+            ),
+            created_at=(
+                from_storage(revision.created_at)
+                if revision.created_at is not None
+                else None
+            ),
+        )
+
+    def amendments_out_from_history(history) -> EventAmendmentsOut:
+        return EventAmendmentsOut(
+            event_id=history.event_id,
+            current_revision=history.current_revision,
+            original=revision_out_from_stored(history.original),
+            history=[
+                revision_out_from_stored(revision) for revision in history.amendments
+            ],
+            current=revision_out_from_stored(history.current),
+        )
+
+    @app.post(
+        "/events/{event_id}/amendments",
+        response_model=EventAmendmentAcceptedOut,
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            200: {
+                "description": (
+                    "the amendment_id was already applied with identical "
+                    "content (idempotent replay)"
+                )
+            },
+            404: {"description": "event_id is not stored (or its body was cleaned up before any amendment froze it)"},
+            409: {
+                "description": (
+                    "base_revision is stale (another branch amended first), "
+                    "device_id differs from the ingested one, or the "
+                    "amendment_id is reused with different content; nothing is stored"
+                )
+            },
+            422: {"description": "event_id mismatch between path and body, unknown contract, or payload validation failure"},
+        },
+    )
+    def submit_event_amendment(
+        event_id: str,
+        body: EventAmendmentIn,
+        response: Response,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> EventAmendmentAcceptedOut:
+        """Append one immutable amendment to an accepted event.
+
+        The event's identity -- ``device_id`` and ``event_id`` -- is fixed
+        at ingestion and can never be changed; the request instead provides
+        the complete replacement body (``occurred_at`` plus the optional
+        contract triplet), which is validated against the registered JSON
+        Schema exactly like ``POST /events``. ``base_revision`` is the
+        revision the client based the correction on.
+
+        Every decision runs inside one ``BEGIN IMMEDIATE`` transaction: the
+        current revision is read under the single writer lock and compared
+        with ``base_revision``, so two concurrent branches serialize and
+        exactly one succeeds -- the stale branch gets ``409`` and stores no
+        row. The first accepted amendment freezes the original ingestion
+        body as immutable revision 1 (copied verbatim from ``events``);
+        every amendment appends the next revision and replaces the live
+        ``events`` body columns. Re-POSTing the same ``amendment_id`` with
+        the identical content is an idempotent replay (``200``); reusing
+        the id with different content is ``409``.
+
+        Amendments change the body seen by sessions, search and timelines,
+        but they append no transparency Merkle leaf, project no
+        state-machine transition and recompute no alarms: existing derived
+        results and the receipt stay bound to the original ingestion record.
+        The frozen revisions live in their own table, so the full chain
+        -- including the original -- remains readable after retention
+        cleanup deletes the live event body.
+        """
+        if body.event_id != event_id:
+            raise HTTPException(
+                status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": "event_id in the path and in the body must match",
+                    "errors": [
+                        {
+                            "path": "/event_id",
+                            "error": f"{event_id} != {body.event_id}",
+                        }
+                    ],
+                },
+            )
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = apply_amendment(
+                conn,
+                get_contract,
+                event_id=event_id,
+                amendment_id=body.amendment_id,
+                base_revision=body.base_revision,
+                device_id=body.device_id,
+                occurred_at=body.occurred_at,
+                event_type=body.event_type,
+                schema_version=body.schema_version,
+                payload=body.payload,
+                payload_provided="payload" in body.model_fields_set,
+            )
+            conn.commit()
+        except EventNotFound:
+            conn.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"event {event_id!r} is not stored",
+            ) from None
+        except ContractError as exc:
+            conn.rollback()
+            raise unprocessable(exc) from exc
+        except AmendmentConflict as exc:
+            conn.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=exc.detail
+            ) from exc
+        except Exception:
+            conn.rollback()
+            raise
+
+        current = result.history.current
+        if result.replay:
+            response.status_code = status.HTTP_200_OK
+        return EventAmendmentAcceptedOut(
+            replay=result.replay,
+            amendment_id=body.amendment_id,
+            revision=current.revision,
+            base_revision=body.base_revision,
+            event=EventOut(
+                device_id=current.device_id,
+                event_id=current.event_id,
+                occurred_at=from_storage(current.occurred_at),
+                event_type=current.event_type,
+                schema_version=current.schema_version,
+                payload=(
+                    json.loads(current.payload)
+                    if current.payload is not None
+                    else None
+                ),
+            ),
+            amendments=amendments_out_from_history(result.history),
+        )
+
+    @app.get(
+        "/events/{event_id}/amendments",
+        response_model=EventAmendmentsOut,
+        responses={
+            404: {
+                "description": (
+                    "unknown event_id, or its body was cleaned up before any "
+                    "amendment froze the chain"
+                )
+            }
+        },
+    )
+    def list_event_amendments(
+        event_id: str,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> EventAmendmentsOut:
+        """Read the immutable amendment chain of one event.
+
+        Returns the frozen original ingestion record (``original``), every
+        accepted amendment ordered by revision (``history``), and the
+        current effective body (``current``). Before the first amendment
+        the original and the current are the live ``events`` body and the
+        history is empty. Once the first amendment freezes revision 1 the
+        whole chain is served from its own table, so it stays readable
+        after retention cleanup removes the live event body.
+        """
+        history = get_amendment_history(conn, event_id)
+        if history is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"event {event_id!r} is not stored",
+            )
+        return amendments_out_from_history(history)
 
     @app.get("/devices/{device_id}/sessions", response_model=list[SessionOut])
     def list_sessions(
